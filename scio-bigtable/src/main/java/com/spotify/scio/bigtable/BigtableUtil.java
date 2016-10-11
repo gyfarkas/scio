@@ -18,11 +18,11 @@
 package com.spotify.scio.bigtable;
 
 import com.google.bigtable.repackaged.com.google.cloud.config.BigtableOptions;
+import com.google.bigtable.repackaged.com.google.cloud.grpc.BigtableInstanceClient;
+import com.google.bigtable.repackaged.com.google.cloud.grpc.BigtableInstanceGrpcClient;
 import com.google.bigtable.repackaged.com.google.cloud.grpc.io.ChannelPool;
 import com.google.bigtable.repackaged.com.google.com.google.bigtable.admin.v2.Cluster;
 import com.google.bigtable.repackaged.com.google.com.google.bigtable.admin.v2.ListClustersRequest;
-import com.google.bigtable.repackaged.com.google.com.google.bigtable.admin.v2.BigtableInstanceAdminGrpc;
-import com.google.bigtable.repackaged.com.google.com.google.bigtable.admin.v2.BigtableInstanceAdminGrpc.BigtableInstanceAdminBlockingStub;
 import com.google.bigtable.repackaged.com.google.com.google.bigtable.admin.v2.ListClustersResponse;
 import com.google.cloud.bigtable.dataflow.CloudBigtableConfiguration;
 import org.joda.time.Duration;
@@ -53,26 +53,31 @@ public final class BigtableUtil {
                                                  final int numberOfNodes,
                                                  final Duration sleepDuration) throws IOException, InterruptedException {
     final BigtableOptions bigtableOptions = cloudBigtableConfiguration.toBigtableOptions();
-    final ChannelPool channelPool = ChannelPoolCreator.createPool(bigtableOptions.getClusterAdminHost());
-    final BigtableInstanceAdminBlockingStub adminGrpc = BigtableInstanceAdminGrpc.newBlockingStub(channelPool);
 
-    final String instanceName = bigtableOptions.getInstanceName().toString();
+    final ChannelPool channelPool = ChannelPoolCreator.createPool(bigtableOptions.getInstanceAdminHost());
 
-    // Fetch clusters in Bigtable instance
-    final ListClustersRequest clustersRequest = ListClustersRequest.newBuilder().setParent(instanceName).build();
-    final ListClustersResponse clustersResponse = adminGrpc.listClusters(clustersRequest);
+    try {
+      final BigtableInstanceClient bigtableInstanceClient = new BigtableInstanceGrpcClient(channelPool);
 
-    // For each cluster update the number of nodes
-    for (Cluster cluster : clustersResponse.getClustersList()) {
-      final Cluster updatedCluster = Cluster.newBuilder()
-              .setName(cluster.getName())
-              .setServeNodes(numberOfNodes)
-              .build();
-      adminGrpc.updateCluster(updatedCluster);
+      final String instanceName = bigtableOptions.getInstanceName().toString();
+
+      // Fetch clusters in Bigtable instance
+      final ListClustersRequest clustersRequest = ListClustersRequest.newBuilder().setParent(instanceName).build();
+      final ListClustersResponse clustersResponse = bigtableInstanceClient.listCluster(clustersRequest);
+
+      // For each cluster update the number of nodes
+      for (Cluster cluster : clustersResponse.getClustersList()) {
+        final Cluster updatedCluster = Cluster.newBuilder()
+            .setName(cluster.getName())
+            .setServeNodes(numberOfNodes)
+            .build();
+        bigtableInstanceClient.updateCluster(updatedCluster);
+      }
+
+      // Wait for the new nodes to be provisioned
+      Thread.sleep(TimeUnit.SECONDS.toMillis(sleepDuration.getStandardSeconds()));
+    } finally {
+      channelPool.shutdownNow();
     }
-
-    // Wait for the new nodes to be provisioned
-    Thread.sleep(TimeUnit.SECONDS.toMillis(sleepDuration.getStandardSeconds()));
-    channelPool.shutdownNow();
   }
 }

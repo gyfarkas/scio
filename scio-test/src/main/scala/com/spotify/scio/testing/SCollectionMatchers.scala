@@ -21,6 +21,7 @@ import java.lang.{Iterable => JIterable}
 
 import com.google.cloud.dataflow.sdk.testing.DataflowAssert
 import com.google.cloud.dataflow.sdk.transforms.SerializableFunction
+import com.google.cloud.dataflow.sdk.util.CoderUtils
 import com.spotify.scio.util.ClosureCleaner
 import com.spotify.scio.values.SCollection
 import org.scalatest.matchers.{MatchResult, Matcher}
@@ -29,22 +30,32 @@ import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
 import scala.util.control.NonFatal
 
-private[scio] trait SCollectionMatcher {
+/** Trait with ScalaTest [[Matcher]]s for [[SCollection]]s. */
+trait SCollectionMatchers {
 
   private def m(f: () => Any): MatchResult = {
     val r = try { f(); true } catch { case NonFatal(_) => false }
     MatchResult(r, "", "")
   }
 
-  def containInAnyOrder[T](value: Iterable[T])
-  : Matcher[SCollection[T]] = new Matcher[SCollection[T]] {
-    override def apply(left: SCollection[T]): MatchResult =
-      m(() => DataflowAssert.that(left.internal).containsInAnyOrder(value.asJava))
+  // Due to  https://github.com/GoogleCloudPlatform/DataflowJavaSDK/issues/434
+  // SerDe cycle on each element to keep consistent with values on the expected side
+  private def serDeCycle[T: ClassTag](scollection: SCollection[T]): SCollection[T] = {
+    val coder = scollection.internal.getCoder
+    scollection
+      .map(e => CoderUtils.decodeFromByteArray(coder, CoderUtils.encodeToByteArray(coder, e)))
   }
 
-  def containSingleValue[T](value: T): Matcher[SCollection[T]] = new Matcher[SCollection[T]] {
+  def containInAnyOrder[T: ClassTag](value: Iterable[T])
+  : Matcher[SCollection[T]] = new Matcher[SCollection[T]] {
     override def apply(left: SCollection[T]): MatchResult =
-      m(() => DataflowAssert.thatSingleton(left.internal).isEqualTo(value))
+      m(() => DataflowAssert.that(serDeCycle(left).internal).containsInAnyOrder(value.asJava))
+  }
+
+  def containSingleValue[T: ClassTag](value: T)
+  : Matcher[SCollection[T]] = new Matcher[SCollection[T]] {
+    override def apply(left: SCollection[T]): MatchResult =
+      m(() => DataflowAssert.thatSingleton(serDeCycle(left).internal).isEqualTo(value))
   }
 
   val beEmpty = new Matcher[SCollection[_]] {
@@ -57,7 +68,8 @@ private[scio] trait SCollectionMatcher {
       val g = new SerializableFunction[java.lang.Iterable[Any], Void] {
         val s = size  // defeat closure
         override def apply(input: JIterable[Any]): Void = {
-          assert(input.asScala.size == s)
+          val inputSize = input.asScala.size
+          assert(inputSize == s, s"SCollection had size $inputSize instead of expected size $s")
           null
         }
       }
@@ -68,36 +80,37 @@ private[scio] trait SCollectionMatcher {
   def equalMapOf[K: ClassTag, V: ClassTag](value: Map[K, V])
   : Matcher[SCollection[(K, V)]] = new Matcher[SCollection[(K, V)]] {
     override def apply(left: SCollection[(K, V)]): MatchResult = {
-      m(() => DataflowAssert.thatMap(left.toKV.internal).isEqualTo(value.asJava))
+      m(() => DataflowAssert.thatMap(serDeCycle(left).toKV.internal).isEqualTo(value.asJava))
+    }
+  }
+
+  def notEqualMapOf[K: ClassTag, V: ClassTag](value: Map[K, V])
+  : Matcher[SCollection[(K, V)]] = new Matcher[SCollection[(K, V)]] {
+    override def apply(left: SCollection[(K, V)]): MatchResult = {
+      m(() => DataflowAssert.thatMap(serDeCycle(left).toKV.internal).notEqualTo(value.asJava))
     }
   }
 
   // TODO: investigate why multi-map doesn't work
 
-  def forAll[T](predicate: T => Boolean): Matcher[SCollection[T]] = new Matcher[SCollection[T]] {
+  def satisfy[T: ClassTag](predicate: Iterable[T] => Boolean)
+  : Matcher[SCollection[T]] = new Matcher[SCollection[T]] {
     override def apply(left: SCollection[T]): MatchResult = {
       val f = ClosureCleaner(predicate)
       val g = new SerializableFunction[JIterable[T], Void] {
         override def apply(input: JIterable[T]): Void = {
-          assert(input.asScala.forall(f))
+          assert(f(input.asScala))
           null
         }
       }
-      m(() => DataflowAssert.that(left.internal).satisfies(g))
+      m(() => DataflowAssert.that(serDeCycle(left).internal).satisfies(g))
     }
   }
 
-  def exist[T](predicate: T => Boolean): Matcher[SCollection[T]] = new Matcher[SCollection[T]] {
-    override def apply(left: SCollection[T]): MatchResult = {
-      val f = ClosureCleaner(predicate)
-      val g = new SerializableFunction[JIterable[T], Void] {
-        override def apply(input: JIterable[T]): Void = {
-          assert(input.asScala.exists(f))
-          null
-        }
-      }
-      m(() => DataflowAssert.that(left.internal).satisfies(g))
-    }
-  }
+  def forAll[T: ClassTag](predicate: T => Boolean): Matcher[SCollection[T]] =
+    satisfy(_.forall(predicate))
+
+  def exist[T: ClassTag](predicate: T => Boolean): Matcher[SCollection[T]] =
+    satisfy(_.exists(predicate))
 
 }

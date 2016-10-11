@@ -72,7 +72,7 @@ trait BaseScioShell extends MainGenericRunner {
       .find(File(_).name.startsWith("paradise_"))
       .foreach(command.settings.plugin.appendToValue)
 
-    // Useful settings for for debugging, dumping class files etc:
+    // Useful settings for debugging, dumping class files etc:
     /* command.settings.debug.value = true
     command.settings.Yreploutdir.tryToSet(List(""))
     command.settings.Ydumpclasses.tryToSet(List("")) */
@@ -100,6 +100,7 @@ trait BaseScioShell extends MainGenericRunner {
 
   /** Runs an instance of the shell. */
   def main(args: Array[String]) {
+    sys.props("bigquery.plugin.disable.dump") = "true"
     val retVal = process(args)
     if (!retVal) {
       sys.exit(1)

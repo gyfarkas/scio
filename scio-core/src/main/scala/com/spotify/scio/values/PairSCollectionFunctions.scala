@@ -486,6 +486,16 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)])
     this.applyPerKey(GroupByKey.create[K, V](), kvIterableToTuple[K, V])
 
   /**
+   * Return an SCollection with the pairs from `this` whose keys are in `that`.
+   * @group per_key
+   */
+  def intersectByKey(that: SCollection[K]): SCollection[(K, V)] = self.transform {
+    _.cogroup(that.map((_, ()))).flatMap { t =>
+      if (t._2._1.nonEmpty && t._2._2.nonEmpty) t._2._1.map((t._1, _)) else Seq.empty
+    }
+  }
+
+  /**
    * Return an SCollection with the keys of each tuple.
    * @group transform
    */
@@ -554,12 +564,12 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)])
   }
 
   /**
-   * Return an SCollection with the pairs from `this` whose keys are not in `other`.
+   * Return an SCollection with the pairs from `this` whose keys are not in `that`.
    * @group per_key
    */
-  def subtractByKey[W: ClassTag](that: SCollection[(K, W)]): SCollection[(K, V)] = self.transform {
-    _.cogroup(that).flatMap { t =>
-      if (t._2._1.nonEmpty && t._2._2.isEmpty) t._2._1.map((t._1, _)) else  Seq.empty
+  def subtractByKey(that: SCollection[K]): SCollection[(K, V)] = self.transform {
+    _.cogroup(that.map((_, ()))).flatMap { t =>
+      if (t._2._1.nonEmpty && t._2._2.isEmpty) t._2._1.map((t._1, _)) else Seq.empty
     }
   }
 

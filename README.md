@@ -3,7 +3,7 @@ Scio
 
 [![Build Status](https://travis-ci.org/spotify/scio.svg?branch=master)](https://travis-ci.org/spotify/scio)
 [![codecov.io](https://codecov.io/github/spotify/scio/coverage.svg?branch=master)](https://codecov.io/github/spotify/scio?branch=master)
-[![GitHub license](https://img.shields.io/github/license/spotify/scio.svg)]()
+[![GitHub license](https://img.shields.io/github/license/spotify/scio.svg)](./LICENSE)
 [![Maven Central](https://img.shields.io/maven-central/v/com.spotify/scio-core_2.11.svg)](https://maven-badges.herokuapp.com/maven-central/com.spotify/scio-core_2.11)
 [![Join the chat at https://gitter.im/spotify/scio](https://badges.gitter.im/spotify/scio.svg)](https://gitter.im/spotify/scio?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
@@ -37,7 +37,7 @@ Scio is being donated to Apache Beam as a Scala DSL ([BEAM-302](https://issues.a
 The ubiquitous word count example can be run directly with SBT in local mode, using `README.md` as input.
 
 ```bash
-sbt "project scio-examples" "run-main com.spotify.scio.examples.WordCount --input=README.md --output=wc"
+sbt "scio-examples/run-main com.spotify.scio.examples.WordCount --input=README.md --output=wc"
 cat wc/part-00000-of-00001.txt
 ```
 
@@ -45,7 +45,7 @@ cat wc/part-00000-of-00001.txt
 
 - [Scio Wiki](https://github.com/spotify/scio/wiki) - wiki page
 - [ScalaDocs](http://spotify.github.com/scio) - current API documentation
-- [Big Data Rosetta Code](https://github.com/spotify/big-data-rosetta-code) - comparison of code snippets in Scio, Scalding and Saprk
+- [Big Data Rosetta Code](https://github.com/spotify/big-data-rosetta-code) - comparison of code snippets in Scio, Scalding and Spark
 
 # Artifacts
 

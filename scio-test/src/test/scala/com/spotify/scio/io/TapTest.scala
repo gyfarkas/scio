@@ -31,6 +31,7 @@ import org.apache.avro.Schema
 import org.apache.commons.io.FileUtils
 
 import scala.concurrent.Future
+import scala.reflect.ClassTag
 
 class TapTest extends PipelineSpec {
 
@@ -68,13 +69,8 @@ class TapTest extends PipelineSpec {
   }
 
   it should "support materialize" in {
-    val t1 = runWithInMemoryFuture {
-      makeRecords(_).materialize
-    }
-    verifyTap(t1, expectedRecords)
-
-    val t2 = runWithFileFuture { makeRecords(_).materialize }
-    verifyTap(t2, expectedRecords)
+    val t = runWithFileFuture { makeRecords(_).materialize }
+    verifyTap(t, expectedRecords)
   }
 
   it should "support saveAsAvroFile with SpecificRecord" in {
@@ -195,7 +191,7 @@ class TapTest extends PipelineSpec {
     f.waitForResult()
   }
 
-  def verifyTap[T](tap: Tap[T], expected: Set[T]): Unit = {
+  def verifyTap[T: ClassTag](tap: Tap[T], expected: Set[T]): Unit = {
     tap.value.toSet should equal (expected)
     val sc = ScioContext()
     tap.open(sc) should containInAnyOrder (expected)

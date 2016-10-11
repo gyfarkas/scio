@@ -22,14 +22,17 @@ import java.io.File
 import java.net.{URI, URLClassLoader}
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
+import java.util.jar.{Attributes, JarFile}
 
+import com.google.datastore.v1.{Query, Entity}
 import com.google.api.services.bigquery.model.TableReference
-import com.google.api.services.datastore.DatastoreV1.{Entity, Query}
 import com.google.cloud.dataflow.sdk.Pipeline
 import com.google.cloud.dataflow.sdk.PipelineResult.State
 import com.google.cloud.dataflow.sdk.coders.TableRowJsonCoder
+import com.google.cloud.dataflow.sdk.io.PatchedAvroIO
 import com.google.cloud.dataflow.sdk.{io => gio}
 import com.google.cloud.dataflow.sdk.options._
+import com.google.cloud.dataflow.sdk.runners.inprocess.InProcessPipelineRunner
 import com.google.cloud.dataflow.sdk.runners.{DataflowPipelineJob, DataflowPipelineRunner}
 import com.google.cloud.dataflow.sdk.testing.TestPipeline
 import com.google.cloud.dataflow.sdk.transforms.Combine.CombineFn
@@ -49,7 +52,7 @@ import org.joda.time.Instant
 import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable.{Buffer => MBuffer, Set => MSet}
+import scala.collection.mutable.{Buffer => MBuffer, Map => MMap}
 import scala.concurrent.{Future, Promise}
 import scala.reflect.ClassTag
 import scala.util.Try
@@ -85,8 +88,10 @@ object ScioContext {
   /** Create a new [[ScioContext]] instance for testing. */
   def forTest(): ScioContext = {
     val opts = PipelineOptionsFactory
-      .fromArgs(Array("--appName=JobTest-" + System.currentTimeMillis()))
+      .fromArgs(Array("--appName=" + JobTest.newTestId()))
       .as(classOf[ApplicationNameOptions])
+
+    opts.setRunner(classOf[InProcessPipelineRunner])
     new ScioContext(opts, List[String]())
   }
 
@@ -152,7 +157,7 @@ class ScioContext private[scio] (val options: PipelineOptions,
 
   private[scio] val testId: Option[String] =
     Try(optionsAs[ApplicationNameOptions]).toOption.flatMap { o =>
-      if ("JobTest-[0-9]+".r.pattern.matcher(o.getAppName).matches()) {
+      if (JobTest.isTestId(o.getAppName)) {
         Some(o.getAppName)
       } else {
         None
@@ -175,10 +180,11 @@ class ScioContext private[scio] (val options: PipelineOptions,
         }
         Pipeline.create(options)
       } else {
-        val tp = TestPipeline.create()
+        val testOpts = TestPipeline.testingPipelineOptions()
         // propagate options
-        tp.getOptions.setStableUniqueNames(options.getStableUniqueNames)
-        tp
+        testOpts.setRunner(options.getRunner)
+        testOpts.setStableUniqueNames(options.getStableUniqueNames)
+        TestPipeline.fromOptions(testOpts)
       }
       _pipeline.getCoderRegistry.registerScalaCoders()
     }
@@ -190,7 +196,7 @@ class ScioContext private[scio] (val options: PipelineOptions,
   private var _isClosed: Boolean = false
   private val _promises: MBuffer[(Promise[Tap[_]], Tap[_])] = MBuffer.empty
   private val _queryJobs: MBuffer[QueryJob] = MBuffer.empty
-  private val _accumulators: MSet[String] = MSet.empty
+  private val _accumulators: MMap[String, Accumulator[_]] = MMap.empty
 
   /** Wrap a [[com.google.cloud.dataflow.sdk.values.PCollection PCollection]]. */
   def wrap[T: ClassTag](p: PCollection[T]): SCollection[T] =
@@ -209,11 +215,33 @@ class ScioContext private[scio] (val options: PipelineOptions,
     val javaHome = new File(sys.props("java.home")).getCanonicalPath
     val userDir = new File(sys.props("user.dir")).getCanonicalPath
 
-    classLoader.asInstanceOf[URLClassLoader]
+    val classPathJars = classLoader.asInstanceOf[URLClassLoader]
       .getURLs
       .map(url => new File(url.toURI).getCanonicalPath)
       .filter(p => !p.startsWith(javaHome) && p != userDir)
       .toList
+
+    // fetch jars from classpath jar's manifest Class-Path if present
+    val manifestJars =  classPathJars
+      .filter(_.endsWith(".jar"))
+      .map(p => (p, new JarFile(p).getManifest))
+      .filter { case (p, manifest) =>
+        manifest != null && manifest.getMainAttributes.containsKey(Attributes.Name.CLASS_PATH)}
+      .map { case (p, manifest) => (new File(p).getParentFile,
+        manifest.getMainAttributes.getValue(Attributes.Name.CLASS_PATH).split(" ")) }
+      .flatMap { case (parent, jars) => jars.map(jar =>
+        if (jar.startsWith("/")) {
+          jar // accept absolute path as is
+        } else {
+          new File(parent, jar).getCanonicalPath  // relative path
+        })
+      }
+
+    logger.debug(s"Classpath jars: ${classPathJars.mkString(":")}")
+    logger.debug(s"Manifest jars: ${manifestJars.mkString(":")}")
+
+    // no need to care about duplicates here - should be solved by the SDK uploader
+    classPathJars ++ manifestJars
   }
 
   /** Compute list of local files to make available to workers. */
@@ -286,7 +314,7 @@ class ScioContext private[scio] (val options: PipelineOptions,
         Future.successful(result.getState)
     }
 
-    new ScioResult(result, finalState, pipeline)
+    new ScioResult(result, finalState, _accumulators.values.toSeq, pipeline)
   }
 
   /** Whether the context is closed. */
@@ -372,12 +400,12 @@ class ScioContext private[scio] (val options: PipelineOptions,
     if (this.isTest) {
       this.getTestInput(AvroIO[T](path))
     } else {
-      val transform = gio.AvroIO.Read.from(path)
+      val transform = gio.PatchedAvroIO.Read.from(path)
       val cls = ScioUtil.classOf[T]
       val t = if (classOf[SpecificRecordBase] isAssignableFrom cls) {
         transform.withSchema(cls)
       } else {
-        transform.withSchema(schema).asInstanceOf[gio.AvroIO.Read.Bound[T]]
+        transform.withSchema(schema).asInstanceOf[PatchedAvroIO.Read.Bound[T]]
       }
       wrap(this.applyInternal(t)).setName(path)
     }
@@ -401,9 +429,7 @@ class ScioContext private[scio] (val options: PipelineOptions,
     } else {
       val queryJob = this.bigQueryClient.newQueryJob(sqlQuery, flattenResults)
       _queryJobs.append(queryJob)
-      //DATAFLOW SDK BUG FIX:
-      //wrap(this.applyInternal(gio.BigQueryIO.Read.from(queryJob.table).withoutValidation()))
-      wrap(this.applyInternal(gio.PatchedBigQueryIO.Read.from(queryJob.table).withoutValidation()))
+      wrap(this.applyInternal(gio.BigQueryIO.Read.from(queryJob.table).withoutValidation()))
         .setName(sqlQuery)
     }
   }
@@ -417,9 +443,7 @@ class ScioContext private[scio] (val options: PipelineOptions,
     if (this.isTest) {
       this.getTestInput(BigQueryIO(tableSpec))
     } else {
-      //DATAFLOW SDK BUG FIX:
-      //wrap(this.applyInternal(gio.BigQueryIO.Read.from(table))).setName(tableSpec)
-      wrap(this.applyInternal(gio.PatchedBigQueryIO.Read.from(table))).setName(tableSpec)
+      wrap(this.applyInternal(gio.BigQueryIO.Read.from(table))).setName(tableSpec)
     }
   }
 
@@ -434,13 +458,18 @@ class ScioContext private[scio] (val options: PipelineOptions,
    * Get an SCollection for a Datastore query.
    * @group input
    */
-  def datastore(datasetId: String, query: Query): SCollection[Entity] = pipelineOp {
-    if (this.isTest) {
-      this.getTestInput(DatastoreIO(datasetId, query))
-    } else {
-      wrap(this.applyInternal(gio.DatastoreIO.readFrom(datasetId, query)))
+  def datastore(projectId: String, query: Query, namespace: String = null): SCollection[Entity] =
+    pipelineOp {
+      if (this.isTest) {
+        this.getTestInput(DatastoreIO(projectId, query, namespace))
+      } else {
+        wrap(this.applyInternal(
+          gio.datastore.DatastoreIO.v1().read()
+            .withProjectId(projectId)
+            .withNamespace(namespace)
+            .withQuery(query)))
+      }
     }
-  }
 
   /**
    * Get an SCollection for a Pub/Sub subscription.
@@ -501,11 +530,14 @@ class ScioContext private[scio] (val options: PipelineOptions,
    * Get an SCollection for a text file.
    * @group input
    */
-  def textFile(path: String): SCollection[String] = pipelineOp {
+  def textFile(path: String,
+               compressionType: gio.TextIO.CompressionType = gio.TextIO.CompressionType.AUTO)
+  : SCollection[String] = pipelineOp {
     if (this.isTest) {
       this.getTestInput(TextIO(path))
     } else {
-      wrap(this.applyInternal(gio.TextIO.Read.from(path))).setName(path)
+      wrap(this.applyInternal(gio.TextIO.Read.from(path)
+        .withCompressionType(compressionType))).setName(path)
     }
   }
 
@@ -521,12 +553,13 @@ class ScioContext private[scio] (val options: PipelineOptions,
    * @group accumulator
    */
   def maxAccumulator[T](n: String)(implicit at: AccumulatorType[T]): Accumulator[T] = pipelineOp {
-    require(!_accumulators.contains(n), s"Accumulator $n already exists")
-    _accumulators.add(n)
-    new Accumulator[T] {
+    require(!_accumulators.contains(n), s"Accumulator '$n' already exists")
+    val acc = new Accumulator[T] {
       override val name: String = n
       override val combineFn: CombineFn[T, _, T] = at.maxFn()
     }
+    _accumulators.put(n, acc)
+    acc
   }
 
   /**
@@ -537,12 +570,13 @@ class ScioContext private[scio] (val options: PipelineOptions,
    * @group accumulator
    */
   def minAccumulator[T](n: String)(implicit at: AccumulatorType[T]): Accumulator[T] = pipelineOp {
-    require(!_accumulators.contains(n), s"Accumulator $n already exists")
-    _accumulators.add(n)
-    new Accumulator[T] {
+    require(!_accumulators.contains(n), s"Accumulator '$n' already exists")
+    val acc = new Accumulator[T] {
       override val name: String = n
       override val combineFn: CombineFn[T, _, T] = at.minFn()
     }
+    _accumulators.put(n, acc)
+    acc
   }
 
   /**
@@ -553,12 +587,13 @@ class ScioContext private[scio] (val options: PipelineOptions,
    * @group accumulator
    */
   def sumAccumulator[T](n: String)(implicit at: AccumulatorType[T]): Accumulator[T] = pipelineOp {
-    require(!_accumulators.contains(n), s"Accumulator $n already exists")
-    _accumulators.add(n)
-    new Accumulator[T] {
+    require(!_accumulators.contains(n), s"Accumulator '$n' already exists")
+    val acc = new Accumulator[T] {
       override val name: String = n
       override val combineFn: CombineFn[T, _, T] = at.sumFn()
     }
+    _accumulators.put(n, acc)
+    acc
   }
 
   // =======================================================================

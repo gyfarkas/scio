@@ -19,21 +19,22 @@
 
 package com.spotify.scio.values
 
-import java.io.File
+import java.io.{File, PrintStream}
 import java.lang.{Boolean => JBoolean, Double => JDouble, Iterable => JIterable}
 import java.net.URI
 import java.util.UUID
 
 import com.google.api.services.bigquery.model.{TableReference, TableRow, TableSchema}
-import com.google.api.services.datastore.DatastoreV1.Entity
 import com.google.cloud.dataflow.sdk.coders.{Coder, TableRowJsonCoder}
 import com.google.cloud.dataflow.sdk.io.BigQueryIO.Write.{CreateDisposition, WriteDisposition}
+import com.google.cloud.dataflow.sdk.io.PatchedAvroIO
 import com.google.cloud.dataflow.sdk.{io => gio}
-import com.google.cloud.dataflow.sdk.runners
 import com.google.cloud.dataflow.sdk.transforms._
 import com.google.cloud.dataflow.sdk.transforms.windowing._
 import com.google.cloud.dataflow.sdk.util.WindowingStrategy.AccumulationMode
 import com.google.cloud.dataflow.sdk.values._
+import com.google.cloud.dataflow.sdk.{io => gio}
+import com.google.datastore.v1.Entity
 import com.google.protobuf.Message
 import com.spotify.scio.ScioContext
 import com.spotify.scio.coders.AvroBytesUtil
@@ -43,6 +44,7 @@ import com.spotify.scio.util._
 import com.spotify.scio.util.random.{BernoulliSampler, PoissonSampler}
 import com.twitter.algebird.{Aggregator, Monoid, Semigroup}
 import org.apache.avro.Schema
+import org.apache.avro.file.CodecFactory
 import org.apache.avro.generic.GenericRecord
 import org.apache.avro.specific.SpecificRecordBase
 import org.joda.time.{Duration, Instant}
@@ -225,6 +227,14 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
   : SCollection[U] = this.transform { in =>
     val a = aggregator  // defeat closure
     in.map(a.prepare).sum(a.semigroup).map(a.present)
+  }
+
+  /**
+   * Filter the elements for which the given PartialFunction is defined, and then map.
+   * @group transform
+   */
+  def collect[U: ClassTag](pfn: PartialFunction[T, U]): SCollection[U] = this.transform {
+    _.filter(pfn.isDefinedAt _).map(pfn)
   }
 
   /**
@@ -512,6 +522,19 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
       .toSCollection
   }
 
+  /**
+   * Print content of a SCollection to `out()`.
+   * @group debug
+   */
+  def debug(out: () => PrintStream = () => Console.out, prefix: String = ""): SCollection[T] =
+    this.filter(e => {
+      // scalastyle:off regex
+      out().println(s"""$prefix${e.toString}""")
+      // scalastyle:on regex
+      // filter that never removes
+      true
+    })
+
   // =======================================================================
   // Accumulators
   // =======================================================================
@@ -774,10 +797,12 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
 
   /**
    * Assign timestamps to values.
+   * With a optional skew
    * @group window
    */
-  def timestampBy(f: T => Instant): SCollection[T] =
-    this.parDo(FunctionsWithWindowedValue.timestampFn(f))
+  def timestampBy(f: T => Instant, allowedTimestampSkew: Duration = Duration.ZERO): SCollection[T] =
+    this.applyTransform(WithTimestamps.of(Functions.serializableFn(f))
+      .withAllowedTimestampSkew(allowedTimestampSkew))
 
   // =======================================================================
   // Write operations
@@ -806,6 +831,7 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
   def saveAsObjectFile(path: String, numShards: Int = 0, suffix: String = ".obj")
   : Future[Tap[T]] = {
     if (context.isTest) {
+      context.testOut(ObjectFileIO(path))(this)
       saveAsInMemoryTap
     } else {
       val elemCoder = this.getCoder[T]
@@ -821,7 +847,7 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
   }
 
   private def pathWithShards(path: String) = {
-    if (this.context.pipeline.getRunner.isInstanceOf[runners.DirectPipelineRunner] &&
+    if (ScioUtil.isLocalRunner(this.context.pipeline.getOptions) &&
       ScioUtil.isLocalUri(new URI(path))) {
       // Create output directory when running locally with local file system
       val f = new File(path)
@@ -833,8 +859,11 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
     path.replaceAll("\\/+$", "") + "/part"
   }
 
-  private def avroOut(path: String, numShards: Int) =
-    gio.AvroIO.Write.to(pathWithShards(path)).withNumShards(numShards).withSuffix(".avro")
+  private def avroOut(path: String, numShards: Int, codec: CodecFactory) =
+    gio.PatchedAvroIO.Write.to(pathWithShards(path))
+          .withNumShards(numShards)
+          .withSuffix(".avro")
+          .withCodec(codec)
 
   private def textOut(path: String, suffix: String, numShards: Int) =
     gio.TextIO.Write.to(pathWithShards(path)).withNumShards(numShards).withSuffix(suffix)
@@ -847,18 +876,22 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
    * @param schema must be not null if T is of type GenericRecord.
    * @group output
    */
-  def saveAsAvroFile(path: String, numShards: Int = 0, schema: Schema = null, suffix: String = "")
+  def saveAsAvroFile(path: String,
+                     numShards: Int = 0,
+                     schema: Schema = null,
+                     suffix: String = "",
+                     codec: CodecFactory = CodecFactory.deflateCodec(6))
   : Future[Tap[T]] =
     if (context.isTest) {
       context.testOut(AvroIO(path))(this)
       saveAsInMemoryTap
     } else {
-      val transform = avroOut(path, numShards).withSuffix(suffix + ".avro")
+      val transform = avroOut(path, numShards, codec).withSuffix(suffix + ".avro")
       val cls = ScioUtil.classOf[T]
       if (classOf[SpecificRecordBase] isAssignableFrom cls) {
         this.applyInternal(transform.withSchema(cls))
       } else {
-        this.applyInternal(transform.withSchema(schema).asInstanceOf[gio.AvroIO.Write.Bound[T]])
+        this.applyInternal(transform.withSchema(schema).asInstanceOf[PatchedAvroIO.Write.Bound[T]])
       }
       context.makeFuture(AvroTap(path + "/part-*", schema))
     }
@@ -918,11 +951,12 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
    * Save this SCollection as a Datastore dataset. Note that elements must be of type Entity.
    * @group output
    */
-  def saveAsDatastore(datasetId: String)(implicit ev: T <:< Entity): Future[Tap[Entity]] = {
+  def saveAsDatastore(projectId: String)(implicit ev: T <:< Entity): Future[Tap[Entity]] = {
     if (context.isTest) {
-      context.testOut(DatastoreIO(datasetId))(this.asInstanceOf[SCollection[Entity]])
+      context.testOut(DatastoreIO(projectId))(this.asInstanceOf[SCollection[Entity]])
     } else {
-      this.asInstanceOf[SCollection[Entity]].applyInternal(gio.DatastoreIO.writeTo(datasetId))
+      this.asInstanceOf[SCollection[Entity]].applyInternal(
+        gio.datastore.DatastoreIO.v1.write.withProjectId(projectId))
     }
     Future.failed(new NotImplementedError("Datastore future not implemented"))
   }
@@ -947,7 +981,7 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
   def saveAsTableRowJsonFile(path: String, numShards: Int = 0)
                             (implicit ev: T <:< TableRow): Future[Tap[TableRow]] =
     if (context.isTest) {
-      context.testOut(BigQueryIO(path))(this.asInstanceOf[SCollection[TableRow]])
+      context.testOut(TableRowJsonIO(path))(this.asInstanceOf[SCollection[TableRow]])
       saveAsInMemoryTap.asInstanceOf[Future[Tap[TableRow]]]
     } else {
       this.asInstanceOf[SCollection[TableRow]].applyInternal(tableRowJsonOut(path, numShards))

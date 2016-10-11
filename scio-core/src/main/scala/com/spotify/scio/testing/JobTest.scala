@@ -18,7 +18,9 @@
 package com.spotify.scio.testing
 
 import java.lang.reflect.InvocationTargetException
+import java.util.UUID
 
+import com.google.cloud.dataflow.sdk.runners.inprocess.InProcessPipelineRunner
 import com.spotify.scio.util.ScioUtil
 import com.spotify.scio.values.SCollection
 
@@ -65,6 +67,14 @@ import scala.util.control.NonFatal
  */
 object JobTest {
 
+  def newTestId(className: String = "TestClass"): String = {
+    val uuid = UUID.randomUUID().toString.replaceAll("-", "")
+    s"JobTest-$className-$uuid"
+  }
+
+  def isTestId(appName: String): Boolean =
+    "JobTest-[^-]+-[a-z0-9]+".r.pattern.matcher(appName).matches()
+
   case class Builder(className: String, cmdlineArgs: Array[String],
                      inputs: Map[TestIO[_], Iterable[_]],
                      outputs: Map[TestIO[_], SCollection[_] => Unit],
@@ -83,7 +93,7 @@ object JobTest {
       this.copy(distCaches = this.distCaches + (key -> value))
 
     def run(): Unit = {
-      val testId = "JobTest-" + System.currentTimeMillis()
+      val testId = newTestId(className)
       TestDataManager.setInput(testId, new TestInput(inputs))
       TestDataManager.setOutput(testId, new TestOutput(outputs))
       TestDataManager.setDistCache(testId, new TestDistCache(distCaches))
@@ -92,7 +102,8 @@ object JobTest {
         Class
           .forName(className)
           .getMethod("main", classOf[Array[String]])
-          .invoke(null, cmdlineArgs :+ s"--appName=$testId")
+          .invoke(null, cmdlineArgs :+ s"--appName=$testId"
+            :+ s"--runner=${classOf[InProcessPipelineRunner].getSimpleName}")
       } catch {
         // InvocationTargetException stacktrace is noisy and useless
         case e: InvocationTargetException => throw e.getCause

@@ -53,10 +53,15 @@ object AlgebirdSpec extends Properties("Algebird") {
 
     def map[U](f: T => U): SColl[U] = new SColl(internal.map(f))
 
+    override def toString: String = internal.mkString("[", ", ", "]")
+
   }
 
   // Generator for non-empty SColl[T]
   def sCollOf[T](g: => Gen[T]): Gen[SColl[T]] = Gen.nonEmptyListOf(g).map(new SColl(_))
+
+  // Generator for SColl[T] of given length
+  def sCollOfN[T](n: Int, g: => Gen[T]): Gen[SColl[T]] = Gen.listOfN(n, g).map(new SColl(_))
 
   // Arbitrary for non-empty SColl[T]
   implicit def arbSColl[T](implicit a: Arbitrary[T]): Arbitrary[SColl[T]] =
@@ -122,12 +127,10 @@ object AlgebirdSpec extends Properties("Algebird") {
     }
 
   // x or y could be NaN, Infinity or NegativeInfinity
-  def error(x: Double, y: Double): Double =
-    if (x.isWhole() && y.isWhole()) {
-      math.abs(x - y) / math.max(x, y)
-    } else {
-      0.0
-    }
+  def error(x: Double, y: Double): Double = {
+    val e = math.abs(x - y) / math.max(x, y)
+    if (e.isWhole()) e else 0.0
+  }
 
   property("aggregate of tuples with custom Aggregator") =
     forAll { xs: SColl[(Double, Double, Double, Double)] =>
@@ -197,8 +200,9 @@ object AlgebirdSpec extends Properties("Algebird") {
   // HyperLogLog for approximate distinct count
   // =======================================================================
 
-  property("sum with HyperLogLog") = forAll(sCollOf(Gen.alphaStr)) { xs =>
-    val m = new HyperLogLogMonoid(10)
+  property("sum with HyperLogLog") = forAll(sCollOfN(1000, Gen.alphaStr)) { xs =>
+    // Error is 1.04 / sqrt(2 ^ 24) = 2.5390625E-4
+    val m = new HyperLogLogMonoid(24)
     xs.map(i => m.create(i.getBytes))
       .sum(m)
       .approximateSize
@@ -206,8 +210,9 @@ object AlgebirdSpec extends Properties("Algebird") {
       .boundsContain(xs.internal.toSet.size)
   }
 
-  property("aggregate with HyperLogLog") = forAll(sCollOf(Gen.alphaStr)) { xs =>
-    xs.aggregate(HyperLogLogAggregator(10).composePrepare(_.getBytes))
+  property("aggregate with HyperLogLog") = forAll(sCollOfN(1000, Gen.alphaStr)) { xs =>
+    // Error is 1.04 / sqrt(2 ^ 24) = 2.5390625E-4
+    xs.aggregate(HyperLogLogAggregator(24).composePrepare(_.getBytes))
       .approximateSize
       // approximate bounds should contain exact distinct count
       .boundsContain(xs.internal.toSet.size)
@@ -268,10 +273,7 @@ object AlgebirdSpec extends Properties("Algebird") {
   // CountMinSketch for approximate frequency
   // =======================================================================
 
-  // Generator for SColl[String]
-  val alphaStrs = Gen.listOfN(1000, Gen.alphaStr).map(new SColl(_))
-
-  property("sum with CountMinSketch") = forAll(alphaStrs) { xs =>
+  property("sum with CountMinSketch") = forAll(sCollOfN(1000, Gen.alphaStr)) { xs =>
     import CMSHasherImplicits._
     val m = CMS.monoid[String](0.001, 1e-10, 1)
     val cms = xs.map(m.create).sum(m)
@@ -282,7 +284,7 @@ object AlgebirdSpec extends Properties("Algebird") {
     }
   }
 
-  property("aggregate with CountMinSketch") = forAll(alphaStrs) { xs =>
+  property("aggregate with CountMinSketch") = forAll(sCollOfN(1000, Gen.alphaStr)) { xs =>
     import CMSHasherImplicits._
     val cms = xs.aggregate(CMS.aggregator(0.01, 1e-10, 1))
     val expected = xs.internal.groupBy(identity).mapValues(_.size)
